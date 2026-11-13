@@ -10,8 +10,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** 界面状态。 */
-data class UiState(
+/**
+ * 设置类状态：只由用户操作改变，推理结果不写进这里。
+ * 抽屉只订阅这个 StateFlow，所以识别跑多快都不会引发抽屉重组。
+ */
+data class SettingsState(
     val modelReady: Boolean = false,
     val modelError: String? = null,
     val loading: Boolean = true,
@@ -32,16 +35,22 @@ data class UiState(
     val boost: Boolean = true,
     /** 相机是否直出 RGBA（省掉 YUV 换算 ~20ms） */
     val useRgba: Boolean = true,
-    /** 基准测试结果文本，null 表示还没测 */
-    val benchText: String? = null,
-    val benching: Boolean = false,
-    /** 当前相机流格式，RGBA / YUV */
-    val frameFormat: String = "-",
 
     val frontCamera: Boolean = false,
     val torch: Boolean = false,
 
     val selected: Set<Int> = emptySet(),  // 空 = 全部类别
+
+    /** 基准测试结果文本，null 表示还没测 */
+    val benchText: String? = null,
+    val benching: Boolean = false,
+
+    /** 抽屉是否展开（决定相机是否降频） */
+    val drawerOpen: Boolean = false
+)
+
+/** 检测结果状态：每帧更新，只有画框和 HUD 订阅。 */
+data class FrameState(
     val detections: List<Detection> = emptyList(),
     val counts: List<Pair<Int, Int>> = emptyList(),
     val total: Int = 0,
@@ -51,27 +60,29 @@ data class UiState(
     val fps: Float = 0f,
     val frameW: Int = 0,
     val frameH: Int = 0,
-
-    /** 抽屉展开状态，Compose 里也能读，方便做「拖动时暂停刷新」之类的联动。 */
-    val drawerOpen: Boolean = false
+    val frameFormat: String = "-"
 )
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val _ui = MutableStateFlow(UiState())
-    val ui: StateFlow<UiState> = _ui.asStateFlow()
+    private val _settings = MutableStateFlow(SettingsState())
+    val settings: StateFlow<SettingsState> = _settings.asStateFlow()
+
+    private val _frame = MutableStateFlow(FrameState())
+    val frame: StateFlow<FrameState> = _frame.asStateFlow()
 
     val detector = YoloDetector(app.applicationContext, 480)
 
     private var lastFrameTime = 0L
     private var smoothedFps = 0f
+    private var lastFramePush = 0L
 
     fun loadModel() {
         viewModelScope.launch {
-            _ui.value = _ui.value.copy(loading = true)
-            val b = _ui.value.backend
+            _settings.value = _settings.value.copy(loading = true)
+            val b = _settings.value.backend
             val ok = withContext(Dispatchers.IO) { detector.load(b) }
-            _ui.value = _ui.value.copy(
+            _settings.value = _settings.value.copy(
                 loading = false,
                 modelReady = ok,
                 modelError = if (ok) null else detector.lastError
@@ -80,12 +91,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setBackend(b: Backend) {
-        if (_ui.value.backend == b) return
-        _ui.value = _ui.value.copy(backend = b, loading = true, modelReady = false)
+        if (_settings.value.backend == b) return
+        applyBackend(b)
+    }
+
+    private fun applyBackend(b: Backend) {
+        _settings.value = _settings.value.copy(backend = b, loading = true, modelReady = false)
         viewModelScope.launch {
-            detector.numThreads = _ui.value.threads
+            detector.numThreads = _settings.value.threads
             val ok = withContext(Dispatchers.IO) { detector.load(b) }
-            _ui.value = _ui.value.copy(
+            _settings.value = _settings.value.copy(
                 loading = false,
                 modelReady = ok,
                 modelError = if (ok) null else detector.lastError
@@ -96,39 +111,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun setThreads(n: Int) {
         val v = n.coerceIn(1, 8)
         detector.numThreads = v
-        _ui.value = _ui.value.copy(threads = v)
+        _settings.value = _settings.value.copy(threads = v)
     }
 
     /**
-     * 加速组合拳总开关。
-     *
-     * 打开时一次性做四件事：
+     * 加速组合拳总开关：打开时一次做四件事。
      *  1. 相机 RGBA 直出 —— 省掉每帧 YUV→RGB 换算
      *  2. 模型输入降到 416 —— 计算量约为 480 的 75%
      *  3. 预处理帧长边降到 416 —— 旋转缩放更省
-     *  4. 线程数拉到 4 并切 NNAPI(fp16) —— 尝试走 GPU/DSP
-     *
-     * 关掉时全部回到保守值：YUV / 640 / XNNPACK / 4 线程。
+     *  4. 线程 4 + 切 NNAPI(fp16) —— 尝试走 GPU/DSP
+     * 关掉时全部回保守值：YUV / 480 / XNNPACK / 4 线程。
      */
     fun setBoost(on: Boolean) {
         if (on) {
-            _ui.value = _ui.value.copy(
-                boost = true,
-                useRgba = true,
-                modelInput = 416,
-                maxSide = 416,
-                threads = 4
+            _settings.value = _settings.value.copy(
+                boost = true, useRgba = true,
+                modelInput = 416, maxSide = 416, threads = 4
             )
             detector.inputSize = 416
             detector.numThreads = 4
             applyBackend(Backend.NNAPI)
         } else {
-            _ui.value = _ui.value.copy(
-                boost = false,
-                useRgba = false,
-                modelInput = 480,
-                maxSide = 480,
-                threads = 4
+            _settings.value = _settings.value.copy(
+                boost = false, useRgba = false,
+                modelInput = 480, maxSide = 480, threads = 4
             )
             detector.inputSize = 480
             detector.numThreads = 4
@@ -138,42 +144,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 单独切 RGBA 直出，不影响其他项。 */
     fun setUseRgba(on: Boolean) {
-        _ui.value = _ui.value.copy(useRgba = on)
-    }
-
-    private fun applyBackend(b: Backend) {
-        _ui.value = _ui.value.copy(backend = b, loading = true, modelReady = false)
-        viewModelScope.launch {
-            detector.numThreads = _ui.value.threads
-            val ok = withContext(Dispatchers.IO) { detector.load(b) }
-            _ui.value = _ui.value.copy(
-                loading = false,
-                modelReady = ok,
-                modelError = if (ok) null else detector.lastError
-            )
-        }
+        _settings.value = _settings.value.copy(useRgba = on)
     }
 
     /** 各后端各跑 N 轮取中位数，写入 benchText。 */
     fun runBenchmark(rounds: Int = 15) {
-        if (_ui.value.benching) return
-        _ui.value = _ui.value.copy(benching = true, benchText = "测试中…")
+        if (_settings.value.benching) return
+        _settings.value = _settings.value.copy(benching = true, benchText = "测试中…")
         viewModelScope.launch {
             val sb = StringBuilder()
-            val original = _ui.value.backend
+            val original = _settings.value.backend
             for (b in Backend.entries) {
                 val ok = withContext(Dispatchers.IO) { detector.load(b) }
                 if (!ok) {
-                    sb.append("${b.label}: 加载失败\n")
+                    sb.append(b.label).append(": 加载失败\n")
                     continue
                 }
-                val line = withContext(Dispatchers.Default) {
-                    detector.bench(rounds)
-                }
+                val line = withContext(Dispatchers.Default) { detector.bench(rounds) }
                 sb.append(b.label).append(": ").append(line).append('\n')
             }
             withContext(Dispatchers.IO) { detector.load(original) }
-            _ui.value = _ui.value.copy(
+            _settings.value = _settings.value.copy(
                 benching = false,
                 benchText = sb.toString().trim(),
                 backend = original
@@ -181,55 +172,80 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun setFrameFormat(f: String) {
-        if (_ui.value.frameFormat != f) _ui.value = _ui.value.copy(frameFormat = f)
-    }
-
     fun toggleRunning() {
-        val next = !_ui.value.running
-        _ui.value = _ui.value.copy(
-            running = next,
-            detections = if (next) _ui.value.detections else emptyList(),
-            counts = if (next) _ui.value.counts else emptyList(),
-            total = if (next) _ui.value.total else 0
-        )
+        val next = !_settings.value.running
+        _settings.value = _settings.value.copy(running = next)
+        if (!next) {
+            _frame.value = _frame.value.copy(
+                detections = emptyList(), counts = emptyList(), total = 0
+            )
+        }
     }
 
-    fun toggleCount() { _ui.value = _ui.value.copy(countMode = !_ui.value.countMode) }
-    fun toggleLabels() { _ui.value = _ui.value.copy(showLabels = !_ui.value.showLabels) }
-    fun toggleScore() { _ui.value = _ui.value.copy(showScore = !_ui.value.showScore) }
+    fun toggleCount() = _settings.value.let {
+        _settings.value = it.copy(countMode = !it.countMode)
+    }
 
-    fun setConf(v: Float) { _ui.value = _ui.value.copy(conf = v.coerceIn(0.05f, 0.95f)) }
-    fun setIou(v: Float) { _ui.value = _ui.value.copy(iou = v.coerceIn(0.1f, 0.95f)) }
+    fun toggleLabels() = _settings.value.let {
+        _settings.value = it.copy(showLabels = !it.showLabels)
+    }
+
+    fun toggleScore() = _settings.value.let {
+        _settings.value = it.copy(showScore = !it.showScore)
+    }
+
+    fun setConf(v: Float) {
+        _settings.value = _settings.value.copy(conf = v.coerceIn(0.05f, 0.95f))
+    }
+
+    fun setIou(v: Float) {
+        _settings.value = _settings.value.copy(iou = v.coerceIn(0.1f, 0.95f))
+    }
 
     fun setMaxSide(v: Int) {
-        _ui.value = _ui.value.copy(maxSide = v.coerceIn(256, 1280))
+        _settings.value = _settings.value.copy(maxSide = v.coerceIn(256, 1280))
     }
 
     /** 模型输入边长，32 的倍数，320..640。 */
     fun setModelInput(v: Int) {
         val snapped = (((v.coerceIn(320, 640) + 16) / 32) * 32)
-        if (snapped == _ui.value.modelInput) return
+        if (snapped == _settings.value.modelInput) return
         detector.inputSize = snapped
-        _ui.value = _ui.value.copy(modelInput = snapped)
+        _settings.value = _settings.value.copy(modelInput = snapped)
     }
 
     fun toggleClass(id: Int) {
-        val cur = _ui.value.selected.toMutableSet()
+        val cur = _settings.value.selected.toMutableSet()
         if (!cur.add(id)) cur.remove(id)
-        _ui.value = _ui.value.copy(selected = cur)
+        _settings.value = _settings.value.copy(selected = cur)
     }
 
-    fun clearClasses() { _ui.value = _ui.value.copy(selected = emptySet()) }
-    fun selectQuick() { _ui.value = _ui.value.copy(selected = CocoLabels.QUICK.toSet()) }
+    fun clearClasses() = _settings.value.let {
+        _settings.value = it.copy(selected = emptySet())
+    }
 
-    fun setFront(front: Boolean) { _ui.value = _ui.value.copy(frontCamera = front, torch = false) }
-    fun setTorch(on: Boolean) { _ui.value = _ui.value.copy(torch = on) }
+    fun selectQuick() = _settings.value.let {
+        _settings.value = it.copy(selected = CocoLabels.QUICK.toSet())
+    }
+
+    fun setFront(front: Boolean) = _settings.value.let {
+        _settings.value = it.copy(frontCamera = front, torch = false)
+    }
+
+    fun setTorch(on: Boolean) = _settings.value.let {
+        _settings.value = it.copy(torch = on)
+    }
 
     fun setDrawerOpen(open: Boolean) {
-        if (_ui.value.drawerOpen != open) _ui.value = _ui.value.copy(drawerOpen = open)
+        if (_settings.value.drawerOpen != open) {
+            _settings.value = _settings.value.copy(drawerOpen = open)
+        }
     }
 
+    /**
+     * 推理结果回写。节流到 ~12Hz，避免每帧都触发 Compose 重组，
+     * 抽屉拖动时被高频重组打断。
+     */
     fun onDetectorResult(out: DetectorOutput) {
         val now = System.nanoTime()
         if (lastFrameTime != 0L) {
@@ -241,13 +257,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         lastFrameTime = now
 
+        // 首帧立即推，之后最少间隔 80ms
+        if (lastFramePush != 0L && now - lastFramePush < 80_000_000L) return
+        lastFramePush = now
+
         val counts = out.detections
             .groupingBy { it.classId }
             .eachCount()
             .toList()
             .sortedByDescending { it.second }
 
-        _ui.value = _ui.value.copy(
+        _frame.value = FrameState(
             detections = out.detections,
             counts = counts,
             total = out.detections.size,
@@ -256,8 +276,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             postMs = out.postprocessMs,
             fps = smoothedFps,
             frameW = out.frameWidth,
-            frameH = out.frameHeight
+            frameH = out.frameHeight,
+            frameFormat = _frame.value.frameFormat
         )
+    }
+
+    fun setFrameFormat(f: String) {
+        if (_frame.value.frameFormat != f) {
+            _frame.value = _frame.value.copy(frameFormat = f)
+        }
     }
 
     override fun onCleared() {
