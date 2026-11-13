@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    name: 编译 Debug APK
+    name: 编译 APK
     runs-on: ubuntu-latest
 
     steps:
@@ -22,8 +22,27 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 配置 Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest 镜像自带 Android SDK（含 build-tools / platforms），
+      # 不再用 android-actions/setup-android，避免它在新版 sdkmanager 上误判版本后报错退出。
+      - name: 检查预装 Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME/platforms" || true
+          ls "$ANDROID_HOME/build-tools" || true
+
+      - name: 安装缺失的 SDK 平台
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "sdk.dir=$SDK" > local.properties
+          # 若镜像里还没有 android-36 / build-tools 36，就补装一份
+          if [ ! -d "$SDK/platforms/android-36" ]; then
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" >/dev/null || true
+          fi
+          if [ ! -d "$SDK/build-tools/36.0.0" ]; then
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0" >/dev/null || true
+          fi
+          ls "$SDK/platforms" || true
 
       - name: 缓存 Gradle
         uses: actions/cache@v4
