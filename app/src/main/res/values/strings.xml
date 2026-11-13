@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">地球online直装</string>
+    <string name="camera_permission_hint">需要相机权限才能识别</string>
+</resources>
